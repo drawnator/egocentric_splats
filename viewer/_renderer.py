@@ -126,8 +126,15 @@ class Renderer(threading.Thread):
         else:
             self._task = task
 
-        if self._state == "high" and self._task.action in ["move", "rerender"]:
-            self._may_interrupt_render = True
+        # UFMG fix (2026-11-09): do NOT interrupt an in-flight render. The upstream code set
+        # `_may_interrupt_render = True` here so a new move/rerender task aborts the current render
+        # by raising InterruptRenderException mid-execution (via sys.settrace). When that abort
+        # fires inside the CUDA/gsplat render it leaves GPU/allocator state in flight and corrupts
+        # the heap, which later crashes the whole training process (segfault in a jemalloc bg
+        # thread, seen as libarrow.so). Letting the current render finish before the next one costs
+        # a little viewer latency but keeps training alive while the user changes viewer settings.
+        # if self._state == "high" and self._task.action in ["move", "rerender"]:
+        #     self._may_interrupt_render = True
         self._render_event.set()
 
     def run(self):
@@ -161,8 +168,13 @@ class Renderer(threading.Thread):
             except InterruptRenderException:
                 continue
             except Exception:
+                # UFMG fix (2026-11-09): a failed viewer render must NOT kill training. Upstream
+                # called os._exit(1) here, hard-killing the whole process (and all training
+                # progress) from this background thread on any render error. Log and skip the
+                # frame instead; the training loop and viewer keep running.
                 traceback.print_exc()
-                os._exit(1)
+                time.sleep(0.5)
+                continue
             #@todo: make jpg quality optional
             self.client.scene.set_background_image(
                 img,
